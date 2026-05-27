@@ -296,28 +296,58 @@ class dinov3Trainer(nnUNetTrainer):
             save_json(dct, join(self.output_folder, "debug.json"))
 
     @staticmethod
-    def build_network_architecture(patch_size: tuple, 
-                                   architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
-    
+    def build_network_architecture(patch_size: tuple,
+                                architecture_class_name: str,
+                                arch_init_kwargs: dict,
+                                arch_init_kwargs_req_import,
+                                num_input_channels: int,
+                                num_output_channels: int,
+                                enable_deep_supervision: bool = True) -> "nn.Module":
+
+        import torch
         from nnunetv2.training.nnUNetTrainer.dinov3.dinov3.models.vision_transformer import vit_base
-        # Initialize model
-        model = vit_base(drop_path_rate=0.2, layerscale_init=1.0e-05)
-        # Load checkpoint
+        from nnunetv2.training.nnUNetTrainer.dinov3.dinov3.models.primus_3d import Primus_Multiscale_3D
+
+        # Sanity-check we're being called in 3D mode
+        assert len(patch_size) == 3, (
+            f"Primus_Multiscale_3D expects 3D patches; got patch_size={patch_size}. "
+            f"Use -c 3d_fullres."
+        )
+        pD, pH, pW = patch_size
+        assert pH % 16 == 0 and pW % 16 == 0, (
+            f"In-plane patch size must be divisible by 16 (DINOv3 patch size); "
+            f"got H={pH}, W={pW}. Adjust your nnUNetPlans.json."
+        )
+        assert num_input_channels == 1, (
+            f"Baseline supports single-channel input only; got num_input_channels={num_input_channels}. "
+            f"For multi-phase DCE-MRI, use a separate trainer or upgrade the model."
+        )
+
+        # Initialize DINOv3 ViT-B (2D)
+        model = vit_base(drop_path_rate=0.0, layerscale_init=1.0e-05)
+
+        # Load Meta's LVD-1689M checkpoint
         chkpt = torch.load(
-            '/scr2/yl_li/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
+            '/hpc/pzha670/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
             map_location='cpu'
         )
-        # Load with strict=False so it won’t crash on mismatches
         missing, unexpected = model.load_state_dict(chkpt, strict=False)
+        if len(missing) > 0:
+            print(f"[dinov3Trainer] {len(missing)} missing keys when loading DINOv3 checkpoint")
+        if len(unexpected) > 0:
+            print(f"[dinov3Trainer] {len(unexpected)} unexpected keys when loading DINOv3 checkpoint")
 
-        from nnunetv2.training.nnUNetTrainer.dinov3.dinov3.models.primus import Primus
-        primus = Primus(embed_dim=768, patch_embed_size=16, num_classes=num_output_channels, dino_encoder=model)
+        primus = Primus_Multiscale_3D(
+            embed_dim=768,
+            patch_embed_size=16,
+            num_classes=num_output_channels,
+            num_input_channels=num_input_channels,
+            dino_encoder=model,
+            interaction_indices=[2, 5, 8, 11],  # matches MedDINOv3 paper
+        )
+
         return primus
+
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
